@@ -111,17 +111,43 @@ async function sendDiscordAlert(message, screenshotPath = null) {
 }
 
 function parseCookieList(rawCookieStr) {
-  const formatted = rawCookieStr.includes('=') ? rawCookieStr : `sid=${rawCookieStr}`;
-  return formatted.split(';').map(pair => {
+  const cleaned = (rawCookieStr || '')
+    .trim()
+    .replace(/^['"`]+|['"`]+$/g, '')
+    .replace(/^cookie:\s*/i, '')
+    .trim();
+
+  if (!cleaned) return [];
+
+  const sidMatch = cleaned.match(/(?:^|;\s*)sid=([^;\s'"]+)/i);
+  if (sidMatch && sidMatch[1]) {
+    return [{
+      name: 'sid',
+      value: sidMatch[1].trim(),
+      url: 'https://demongacha.com'
+    }];
+  }
+
+  if (!cleaned.includes('=')) {
+    return [{
+      name: 'sid',
+      value: cleaned,
+      url: 'https://demongacha.com'
+    }];
+  }
+
+  return cleaned.split(';').map(pair => {
     const index = pair.indexOf('=');
+    if (index === -1) return null;
     const name = pair.slice(0, index).trim();
     const value = pair.slice(index + 1).trim();
+    if (/^(path|domain|expires|max-age|samesite|secure|httponly)$/i.test(name)) return null;
     return {
       name,
       value,
       url: 'https://demongacha.com'
     };
-  }).filter(c => c.name && c.value);
+  }).filter(c => c && c.name && c.value);
 }
 
 module.exports = {
