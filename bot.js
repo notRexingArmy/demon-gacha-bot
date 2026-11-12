@@ -14,6 +14,7 @@ const {
 const {
   verifyAndRefreshAuth,
   scanCardsOnPage,
+  extractCardsFromApiPayload,
   updateCollectionProgress
 } = require('./scanner');
 
@@ -47,7 +48,7 @@ async function openPacksCycle(state) {
   const knownRanks = new Set(state.discoveredRanks || []);
   const initialCards = await scanCardsOnPage(page);
   for (const c of initialCards) knownRanks.add(c.rankNum);
-  const existingCardIds = new Set(initialCards.map(c => c.id));
+  const existingCardKeys = new Set(initialCards.map(c => `${c.rankNum}-${c.levelName.toLowerCase()}-${c.isHolo}`));
 
   const openAllButton = page.locator(config.OPEN_ALL_SELECTOR).first();
   const openSingleButton = page.locator(config.OPEN_SINGLE_SELECTOR).first();
@@ -81,37 +82,61 @@ async function openPacksCycle(state) {
   const countMatch = buttonText.match(/\((\d+)\)/);
   const packsOpenedNow = countMatch ? parseInt(countMatch[1], 10) : 1;
 
-  await targetOpenButton.click();
-
   const rarePulls = new Map();
   let newCardsThisRun = 0;
   let top10ScreenshotPath = null;
+
+  function recordPulledCards(cards) {
+    let sawTop10 = false;
+    for (const card of cards) {
+      const key = `${card.rankNum}-${card.levelName.toLowerCase()}-${card.isHolo}`;
+      if (existingCardKeys.has(key)) continue;
+      existingCardKeys.add(key);
+
+      const isFirstTimeSeen = card.hasNewBadge || !knownRanks.has(card.rankNum);
+      card.isNew = isFirstTimeSeen;
+      if (isFirstTimeSeen) {
+        newCardsThisRun++;
+        knownRanks.add(card.rankNum);
+      }
+
+      const isRare = (card.rankNum >= 1 && card.rankNum <= 100) || /^(APEX|MYTHIC|LEGENDARY|EPIC)$/.test(card.rarity);
+      if (isRare) {
+        rarePulls.set(`${card.rankNum}-${card.isHolo}`, card);
+      }
+      if ((card.rankNum >= 1 && card.rankNum <= 10) || /^(APEX|MYTHIC)$/.test(card.rarity)) {
+        sawTop10 = true;
+      }
+    }
+    return sawTop10;
+  }
+
+  const responseHandler = async (response) => {
+    try {
+      const url = response.url();
+      if (!url.includes('/api/') || url.includes('/api/me')) return;
+      const contentType = response.headers()['content-type'] || '';
+      if (!contentType.includes('application/json')) return;
+      const json = await response.json().catch(() => null);
+      if (json) {
+        const apiCards = extractCardsFromApiPayload(json);
+        if (apiCards.length > 0) recordPulledCards(apiCards);
+      }
+    } catch (e) {}
+  };
+
+  page.on('response', responseHandler);
+
+  await targetOpenButton.click();
 
   try {
     await continueButton.waitFor({ state: 'visible', timeout: 30000 });
 
     for (let step = 0; step < 25; step++) {
-      await page.waitForTimeout(1000);
+      await page.waitForTimeout(1800);
 
       const currentCards = await scanCardsOnPage(page);
-      let sawTop10OnThisScreen = false;
-
-      for (const card of currentCards) {
-        if (!existingCardIds.has(card.id)) {
-          const isFirstTimeSeen = card.hasNewBadge || !knownRanks.has(card.rankNum);
-          if (isFirstTimeSeen) {
-            card.isNew = true;
-            newCardsThisRun++;
-            knownRanks.add(card.rankNum);
-          } else {
-            card.isNew = false;
-          }
-
-          if (card.rankNum >= 1 && card.rankNum <= 100) rarePulls.set(card.id, card);
-          if (card.rankNum >= 1 && card.rankNum <= 10) sawTop10OnThisScreen = true;
-          existingCardIds.add(card.id);
-        }
-      }
+      const sawTop10OnThisScreen = recordPulledCards(currentCards);
 
       if (sawTop10OnThisScreen && !top10ScreenshotPath) {
         top10ScreenshotPath = 'top10_pull.png';
@@ -122,7 +147,7 @@ async function openPacksCycle(state) {
 
       if (!(await continueButton.isVisible().catch(() => false))) break;
       await continueButton.click();
-      await page.waitForTimeout(1200);
+      await page.waitForTimeout(1500);
 
       const nextAppeared = await continueButton
         .waitFor({ state: 'visible', timeout: 5000 })
@@ -131,6 +156,8 @@ async function openPacksCycle(state) {
       if (!nextAppeared) break;
     }
   } catch (err) {}
+
+  page.off('response', responseHandler);
 
   await updateCollectionProgress(page, state);
 
@@ -142,7 +169,7 @@ async function openPacksCycle(state) {
 
   const sortedPulls = Array.from(rarePulls.values()).sort((a, b) => a.rankNum - b.rankNum);
   const rareList = sortedPulls.map(
-    c => `• ${c.isNew ? '🆕 **[NEW!]** ' : ''}**${c.levelName}** (${c.rank}) — ${c.rarity}${c.isHolo ? ' ✨ **[HOLO]**' : ''}`
+    c => `• ${c.isNew ? '🆕 **[NEW!]** ' : ''}**${c.levelName}** (${c.rank}) — **${c.rarity}**${c.isHolo ? ' ✨ **[HOLO]**' : ''}`
   );
 
   const collectionStatus = state.collectionTotal
@@ -151,16 +178,18 @@ async function openPacksCycle(state) {
 
   const cookieStatus = auth.cookieWasRefreshed ? `\n• 🔄 *Session cookie refreshed in memory!*` : '';
 
-  let report =
+  const report =
     `🎉 **Opened ${packsOpenedNow} Pack(s)!** (\`${buttonText}\`)\n` +
     `• **Total Packs Opened by Bot:** \`${state.totalPacksOpened}\`${collectionStatus}\n` +
     `• **Next Opening In:** ${formatRemaining(state.nextOpenTimestamp)}${cookieStatus}`;
 
+  await sendDiscordAlert(report);
+
   if (rareList.length > 0) {
-    report += `\n\n🔥 **Top 100 Pulls:**\n${rareList.join('\n')}`;
+    const rareAlert = `🔥 **TOP 100 / EPIC+ PULL ALERT!** 🔥\n${rareList.join('\n')}`;
+    await sendDiscordAlert(rareAlert, top10ScreenshotPath);
   }
 
-  await sendDiscordAlert(report, top10ScreenshotPath);
   await browser.close();
 }
 
