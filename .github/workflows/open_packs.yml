@@ -1,0 +1,56 @@
+name: Open Demon Gacha Packs
+
+on:
+  schedule:
+    - cron: '0 */2 * * *'
+  push:
+    paths:
+      - 'config.js'
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Choose an action to run'
+        required: true
+        default: 'open_packs'
+        type: choice
+        options:
+          - open_packs
+          - check_time
+          - check_packs
+          - reset_stats
+          - auto_loop
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: ${{ (github.event.inputs.action == 'check_time' || github.event.inputs.action == 'check_packs' || github.event.inputs.action == 'reset_stats') && format('instant-{0}', github.run_id) || 'demon-gacha-continuous-loop' }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
+
+jobs:
+  open-packs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        if: github.event.inputs.action != 'check_time' && github.event.inputs.action != 'reset_stats'
+        run: npm install
+
+      - name: Run bot
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          RAW_COOKIES: ${{ secrets.RAW_COOKIES }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          BOT_ACTION: ${{ github.event.inputs.action || 'open_packs' }}
+        run: node bot.js
