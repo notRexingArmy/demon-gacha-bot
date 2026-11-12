@@ -1,9 +1,7 @@
 {
-  "totalPacksOpened": 6,
-  "nextOpenTimestamp": 1794514658019,
-  "lastOpenedAt": "2026-11-12T19:20:53.467Z",
-  "refreshedCookie": "sid=TtVqi2_V1sVylN_Uw912g1bH7fEPSOFjvb79CMWU7bA",
-  "lastManualCookie": "sid=TtVqi2_V1sVylN_Uw912g1bH7fEPSOFjvb79CMWU7bA",
+  "totalPacksOpened": 9,
+  "nextOpenTimestamp": 1794519766169,
+  "lastOpenedAt": "2026-11-12T21:32:31.516Z",
   "discoveredRanks": [
     255,
     1352,
@@ -46,7 +44,12 @@
     19,
     816,
     994,
-    1289
+    1289,
+    1259,
+    1167,
+    1539,
+    1317,
+    765
   ],
   "collectionTotal": null
 }
