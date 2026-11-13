@@ -1,4 +1,3 @@
-const { execSync } = require('child_process');
 const { chromium } = require('playwright');
 const config = require('./config');
 const {
@@ -171,8 +170,10 @@ async function openPacksCycle(state) {
 (async () => {
   const action = process.env.BOT_ACTION || 'open_packs';
   const eventName = process.env.GITHUB_EVENT_NAME || '';
-  const isPushRun = eventName === 'push';
-  const isManualOpen = eventName === 'workflow_dispatch' && action === 'open_packs';
+  const shiftNumber = String(process.env.SHIFT_NUMBER || '1');
+  const isFirstShift = shiftNumber === '1';
+  const isPushRun = eventName === 'push' && isFirstShift;
+  const isManualOpen = eventName === 'workflow_dispatch' && action === 'open_packs' && isFirstShift;
   const state = loadState();
 
   if (action === 'check_time') {
@@ -265,11 +266,5 @@ async function openPacksCycle(state) {
     if (Date.now() - loopStartMs >= shiftDurationMs) {
       break;
     }
-  }
-
-  if (process.env.GITHUB_ACTIONS) {
-    try {
-      execSync('gh workflow enable "Open Demon Gacha Packs"', { stdio: 'ignore' });
-    } catch (e) {}
   }
 })();
