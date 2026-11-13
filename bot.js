@@ -245,27 +245,31 @@ async function openPacksCycle(state) {
   }
 
   const loopStartMs = Date.now();
-  const maxLoopMs = 4 * 60 * 60 * 1000;
+  const shiftDurationMs = 3.5 * 60 * 60 * 1000;
+  const hardSafetyLimitMs = 5.3 * 60 * 60 * 1000;
   let forceImmediateFirstRun = isManualOpen;
 
-  while (Date.now() - loopStartMs < maxLoopMs) {
+  while (true) {
     if (!forceImmediateFirstRun) {
       while (state.nextOpenTimestamp && Date.now() < state.nextOpenTimestamp) {
-        if (Date.now() - loopStartMs >= maxLoopMs) break;
+        if (Date.now() - loopStartMs >= hardSafetyLimitMs) break;
         const remainingMs = state.nextOpenTimestamp - Date.now();
         await sleep(Math.min(remainingMs, 10000));
       }
-      if (Date.now() - loopStartMs >= maxLoopMs) break;
+      if (Date.now() - loopStartMs >= hardSafetyLimitMs) break;
     }
 
     forceImmediateFirstRun = false;
     await openPacksCycle(state);
+
+    if (Date.now() - loopStartMs >= shiftDurationMs) {
+      break;
+    }
   }
 
   if (process.env.GITHUB_ACTIONS) {
     try {
       execSync('gh workflow enable "Open Demon Gacha Packs"', { stdio: 'ignore' });
-      execSync('gh workflow run "Open Demon Gacha Packs" -f action=auto_loop', { stdio: 'ignore' });
     } catch (e) {}
   }
 })();
