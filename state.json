@@ -1,7 +1,7 @@
 {
-  "totalPacksOpened": 271,
-  "nextOpenTimestamp": 1794698605255,
-  "lastOpenedAt": "2026-11-14T22:28:28.780Z",
+  "totalPacksOpened": 277,
+  "nextOpenTimestamp": 1794702797323,
+  "lastOpenedAt": "2026-11-14T23:23:46.229Z",
   "discoveredRanks": [
     255,
     1352,
@@ -630,7 +630,13 @@
     897,
     1316,
     1145,
-    1208
+    1208,
+    661,
+    273,
+    1000,
+    1143,
+    1209,
+    1358
   ],
   "collectionTotal": null
 }
