@@ -1,3 +1,61 @@
+const fs = require('fs');
+const { chromium } = require('patchright');
+const { parseCookieList, sleep } = require('./helpers');
+
+async function launchStealthContext(activeCookie) {
+  const profileDir = '/tmp/demon-gacha-profile';
+  if (!fs.existsSync(profileDir)) {
+    fs.mkdirSync(profileDir, { recursive: true });
+  }
+
+  const context = await chromium.launchPersistentContext(profileDir, {
+    channel: 'chrome',
+    headless: false,
+    viewport: null
+  });
+
+  if (activeCookie) {
+    const cookies = parseCookieList(activeCookie);
+    if (cookies.length) {
+      await context.addCookies(cookies);
+    }
+  }
+
+  const page = context.pages()[0] || await context.newPage();
+  return { context, page };
+}
+
+async function waitForCloudflare(page) {
+  for (let attempt = 0; attempt < 12; attempt++) {
+    const title = await page.title().catch(() => '');
+    const bodyText = await page.locator('body').innerText().catch(() => '');
+
+    const cfIframe = page.locator('iframe[src*="challenges.cloudflare.com"]').first();
+    const hasIframe = await cfIframe.isVisible().catch(() => false);
+    const hasChallengeText =
+      /just a moment|attention required|checking your browser|cloudflare/i.test(title) ||
+      /verify you are human|performing security verification|checking if the site connection is secure/i.test(bodyText);
+
+    if (!hasIframe && !hasChallengeText) {
+      return true;
+    }
+
+    if (hasIframe) {
+      const box = await cfIframe.boundingBox().catch(() => null);
+      if (box && box.width > 0 && box.height > 0) {
+        const clickX = box.x + Math.min(32, box.width / 4);
+        const clickY = box.y + box.height / 2;
+        await page.mouse.move(clickX, clickY, { steps: 14 }).catch(() => {});
+        await sleep(300);
+        await page.mouse.click(clickX, clickY).catch(() => {});
+      }
+    }
+
+    await sleep(3500);
+  }
+  return false;
+}
+
 async function checkApiMe(page) {
   return await page.evaluate(async () => {
     try {
@@ -16,7 +74,19 @@ async function verifyAndRefreshAuth(page, context, state, activeCookieStr) {
   const authCheck = await checkApiMe(page);
 
   if (!authCheck.ok || authCheck.status === 401 || authCheck.status === 403 || authCheck.body === 'null') {
-    return { ok: false, status: authCheck.status, cookieWasRefreshed: false, updatedCookie: activeCookieStr };
+    const title = await page.title().catch(() => '');
+    const isCloudflare =
+      authCheck.status === 403 ||
+      /just a moment|attention required|cloudflare/i.test(title) ||
+      /cloudflare|cf-ray/i.test(authCheck.body || '');
+
+    return {
+      ok: false,
+      status: authCheck.status,
+      isCloudflare,
+      cookieWasRefreshed: false,
+      updatedCookie: activeCookieStr
+    };
   }
 
   const browserCookies = await context.cookies('https://demongacha.com');
@@ -41,7 +111,7 @@ async function verifyAndRefreshAuth(page, context, state, activeCookieStr) {
     }
   }
 
-  return { ok: true, status: authCheck.status, cookieWasRefreshed, updatedCookie };
+  return { ok: true, status: authCheck.status, isCloudflare: false, cookieWasRefreshed, updatedCookie };
 }
 
 async function scanCardsOnPage(page) {
@@ -81,7 +151,7 @@ async function scanCardsOnPage(page) {
         }
         const rankNum = allNums.find(n => n > 100) || allNums[allNums.length - 1] || 999;
         const hasNewBadge = lines.some(l => /^NEW!?$/i.test(l));
-        const dedupeKey = `${rankNum}-${explicitRarity}-${ text.slice(0, 40) }`;
+        const dedupeKey = `${rankNum}-${explicitRarity}-${text.slice(0, 40)}`;
         if (!seenKeys.has(dedupeKey)) {
           seenKeys.add(dedupeKey);
           results.push({
@@ -199,6 +269,8 @@ async function updateCollectionProgress(page, state) {
 }
 
 module.exports = {
+  launchStealthContext,
+  waitForCloudflare,
   verifyAndRefreshAuth,
   scanCardsOnPage,
   updateCollectionProgress

@@ -47,7 +47,9 @@ jobs:
 
       - name: Install dependencies
         if: github.event.inputs.action == 'check_packs'
-        run: npm install
+        run: |
+          npm install
+          which xvfb-run || (sudo apt-get update && sudo apt-get install -y xvfb)
 
       - name: Run quick action
         env:
@@ -57,7 +59,12 @@ jobs:
           GITHUB_EVENT_NAME: ${{ github.event_name }}
           BOT_ACTION: ${{ github.event.inputs.action }}
           SHIFT_NUMBER: '1'
-        run: node bot.js
+        run: |
+          if [ "$BOT_ACTION" = "check_packs" ]; then
+            xvfb-run --auto-servernum --server-args="-screen 0 1280x800x24" node bot.js
+          else
+            node bot.js
+          fi
 
   continuous-loop:
     if: github.event_name != 'workflow_dispatch' || (github.event.inputs.action != 'check_time' && github.event.inputs.action != 'check_packs' && github.event.inputs.action != 'reset_stats')
@@ -85,7 +92,9 @@ jobs:
           node-version: '20'
 
       - name: Install dependencies
-        run: npm install
+        run: |
+          npm install
+          which xvfb-run || (sudo apt-get update && sudo apt-get install -y xvfb)
 
       - name: Run bot shift
         env:
@@ -95,7 +104,7 @@ jobs:
           GITHUB_EVENT_NAME: ${{ github.event_name }}
           BOT_ACTION: ${{ github.event.inputs.action || 'auto_loop' }}
           SHIFT_NUMBER: ${{ matrix.shift }}
-        run: node bot.js
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x800x24" node bot.js
 
       - name: Trigger next 24h cycle after Shift 6
         if: always() && matrix.shift == 6 && env.PAT_TOKEN != ''

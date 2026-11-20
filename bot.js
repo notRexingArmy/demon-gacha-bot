@@ -1,4 +1,3 @@
-const { chromium } = require('playwright');
 const config = require('./config');
 const {
   sleep,
@@ -7,10 +6,11 @@ const {
   saveState,
   computeNextSchedule,
   formatRemaining,
-  sendDiscordAlert,
-  parseCookieList
+  sendDiscordAlert
 } = require('./helpers');
 const {
+  launchStealthContext,
+  waitForCloudflare,
   verifyAndRefreshAuth,
   scanCardsOnPage,
   updateCollectionProgress
@@ -19,152 +19,149 @@ const {
 let activeCookie = (process.env.RAW_COOKIES || '').trim();
 
 async function openPacksCycle(state) {
-  const browser = await chromium.launch({ headless: true, channel: 'chrome' });
-  const context = await browser.newContext({
-    viewport: { width: 1280, height: 800 },
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36'
-  });
+  const { context, page } = await launchStealthContext(activeCookie);
 
-  if (activeCookie) {
-    const cookies = parseCookieList(activeCookie);
-    if (cookies.length) await context.addCookies(cookies);
-  }
+  try {
+    await page.goto(config.TARGET_URL, { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+    await waitForCloudflare(page);
+    await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
+    await page.waitForTimeout(4000);
 
-  const page = await context.newPage();
-  await page.goto(config.TARGET_URL, { waitUntil: 'networkidle', timeout: 45000 }).catch(() => {});
-  await page.waitForTimeout(5000);
+    const auth = await verifyAndRefreshAuth(page, context, state, activeCookie);
+    if (!auth.ok) {
+      if (auth.isCloudflare) {
+        await sendDiscordAlert(`🛡️ **Demon Gacha Alert:** Blocked by Cloudflare (HTTP ${auth.status}). Your \`sid\` cookie is likely fine, but Cloudflare challenged this GitHub runner IP.`);
+      } else {
+        await sendDiscordAlert(`⚠️ **Demon Gacha Alert:** Cookie rejected by \`/api/me\` (HTTP ${auth.status}). Please update your \`RAW_COOKIES\` GitHub Secret.`);
+      }
+      await context.close().catch(() => {});
+      process.exit(1);
+    }
 
-  const auth = await verifyAndRefreshAuth(page, context, state, activeCookie);
-  if (!auth.ok) {
-    await sendDiscordAlert(`⚠️ **Demon Gacha Alert:** Cookie rejected by \`/api/me\` (HTTP ${auth.status}). Please update your \`RAW_COOKIES\` GitHub Secret.`);
-    await browser.close();
-    process.exit(1);
-  }
+    activeCookie = auth.updatedCookie;
 
-  activeCookie = auth.updatedCookie;
+    const knownRanks = new Set(state.discoveredRanks || []);
+    const initialCards = await scanCardsOnPage(page);
+    for (const c of initialCards) knownRanks.add(c.rankNum);
+    const existingCardIds = new Set(initialCards.map(c => c.id));
 
-  const knownRanks = new Set(state.discoveredRanks || []);
-  const initialCards = await scanCardsOnPage(page);
-  for (const c of initialCards) knownRanks.add(c.rankNum);
-  const existingCardIds = new Set(initialCards.map(c => c.id));
+    const openAllButton = page.locator(config.OPEN_ALL_SELECTOR).first();
+    const openSingleButton = page.locator(config.OPEN_SINGLE_SELECTOR).first();
+    const continueButton = page.locator(config.CONTINUE_BUTTON_SELECTOR).first();
 
-  const openAllButton = page.locator(config.OPEN_ALL_SELECTOR).first();
-  const openSingleButton = page.locator(config.OPEN_SINGLE_SELECTOR).first();
-  const continueButton = page.locator(config.CONTINUE_BUTTON_SELECTOR).first();
+    await Promise.race([
+      openAllButton.waitFor({ state: 'visible', timeout: 15000 }),
+      openSingleButton.waitFor({ state: 'visible', timeout: 15000 })
+    ]).catch(() => {});
 
-  await Promise.race([
-    openAllButton.waitFor({ state: 'visible', timeout: 15000 }),
-    openSingleButton.waitFor({ state: 'visible', timeout: 15000 })
-  ]).catch(() => {});
+    const hasOpenAll = (await openAllButton.isVisible().catch(() => false)) && (await openAllButton.isEnabled().catch(() => false));
+    const targetOpenButton = hasOpenAll ? openAllButton : openSingleButton;
+    const isButtonVisible = await targetOpenButton.isVisible().catch(() => false);
+    const buttonText = isButtonVisible ? (await targetOpenButton.innerText().catch(() => 'Open')).trim() : 'Open';
+    const canClick = isButtonVisible && (await targetOpenButton.isEnabled().catch(() => false));
 
-  const hasOpenAll = (await openAllButton.isVisible().catch(() => false)) && (await openAllButton.isEnabled().catch(() => false));
-  const targetOpenButton = hasOpenAll ? openAllButton : openSingleButton;
-  const isButtonVisible = await targetOpenButton.isVisible().catch(() => false);
-  const buttonText = isButtonVisible ? (await targetOpenButton.innerText().catch(() => 'Open')).trim() : 'Open';
-  const canClick = isButtonVisible && (await targetOpenButton.isEnabled().catch(() => false));
+    if (!isButtonVisible || !canClick) {
+      state.nextOpenTimestamp = computeNextSchedule();
+      state.discoveredRanks = Array.from(knownRanks);
+      saveState(state, true);
 
-  if (!isButtonVisible || !canClick) {
+      await sendDiscordAlert(
+        `ℹ️ **Run Complete:** Logged in, but 0 packs were ready to open.\n` +
+        `• **Total Packs Opened:** \`${state.totalPacksOpened}\`\n` +
+        `• **Next Opening In:** ${formatRemaining(state.nextOpenTimestamp)}`
+      );
+      return;
+    }
+
+    const countMatch = buttonText.match(/\((\d+)\)/);
+    const packsOpenedNow = countMatch ? parseInt(countMatch[1], 10) : 1;
+
+    await targetOpenButton.click();
+
+    const rarePulls = new Map();
+    let newCardsThisRun = 0;
+    let top10ScreenshotPath = null;
+
+    try {
+      await continueButton.waitFor({ state: 'visible', timeout: 30000 });
+
+      for (let step = 0; step < 25; step++) {
+        await page.waitForTimeout(1800);
+
+        const currentCards = await scanCardsOnPage(page);
+        let sawTop10OnThisScreen = false;
+
+        for (const card of currentCards) {
+          if (existingCardIds.has(card.id)) continue;
+          existingCardIds.add(card.id);
+
+          const isFirstTimeSeen = card.hasNewBadge || !knownRanks.has(card.rankNum);
+          card.isNew = isFirstTimeSeen;
+          if (isFirstTimeSeen) {
+            newCardsThisRun++;
+            knownRanks.add(card.rankNum);
+          }
+
+          if (card.isTop100 && card.rankNum >= 1 && card.rankNum <= 100) {
+            rarePulls.set(`${card.rankNum}-${card.isHolo}`, card);
+            if (card.rankNum >= 1 && card.rankNum <= 10) {
+              sawTop10OnThisScreen = true;
+            }
+          }
+        }
+
+        if (sawTop10OnThisScreen && !top10ScreenshotPath) {
+          top10ScreenshotPath = 'top10_pull.png';
+          await page.screenshot({ path: top10ScreenshotPath, fullPage: true }).catch(() => {
+            top10ScreenshotPath = null;
+          });
+        }
+
+        if (!(await continueButton.isVisible().catch(() => false))) break;
+        await continueButton.click();
+        await page.waitForTimeout(1500);
+
+        const nextAppeared = await continueButton
+          .waitFor({ state: 'visible', timeout: 5000 })
+          .then(() => true)
+          .catch(() => false);
+        if (!nextAppeared) break;
+      }
+    } catch (err) {}
+
+    await updateCollectionProgress(page, state);
+
+    state.totalPacksOpened = (state.totalPacksOpened || 0) + packsOpenedNow;
+    state.lastOpenedAt = new Date().toISOString();
     state.nextOpenTimestamp = computeNextSchedule();
     state.discoveredRanks = Array.from(knownRanks);
     saveState(state, true);
 
-    await sendDiscordAlert(
-      `ℹ️ **Run Complete:** Logged in, but 0 packs were ready to open.\n` +
-      `• **Total Packs Opened:** \`${state.totalPacksOpened}\`\n` +
-      `• **Next Opening In:** ${formatRemaining(state.nextOpenTimestamp)}`
+    const sortedPulls = Array.from(rarePulls.values()).sort((a, b) => a.rankNum - b.rankNum);
+    const rareList = sortedPulls.map(
+      c => `• ${c.isNew ? '🆕 **[NEW!]** ' : ''}**${c.levelName}** (${c.rank}) — **${c.rarity}**${c.isHolo ? ' ✨ **[HOLO]**' : ''}`
     );
-    await browser.close();
-    return;
-  }
 
-  const countMatch = buttonText.match(/\((\d+)\)/);
-  const packsOpenedNow = countMatch ? parseInt(countMatch[1], 10) : 1;
+    const collectionStatus = state.collectionTotal
+      ? `\n• **Collection Progress:** \`${state.collectionTotal}\` (\`+${newCardsThisRun}\` new this run)`
+      : `\n• **New Cards This Run:** \`${newCardsThisRun}\``;
 
-  await targetOpenButton.click();
+    const cookieStatus = auth.cookieWasRefreshed ? `\n• 🔄 *Session cookie refreshed in memory!*` : '';
 
-  const rarePulls = new Map();
-  let newCardsThisRun = 0;
-  let top10ScreenshotPath = null;
+    const report =
+      `🎉 **Opened ${packsOpenedNow} Pack(s)!** (\`${buttonText}\`)\n` +
+      `• **Total Packs Opened by Bot:** \`${state.totalPacksOpened}\`${collectionStatus}\n` +
+      `• **Next Opening In:** ${formatRemaining(state.nextOpenTimestamp)}${cookieStatus}`;
 
-  try {
-    await continueButton.waitFor({ state: 'visible', timeout: 30000 });
+    await sendDiscordAlert(report);
 
-    for (let step = 0; step < 25; step++) {
-      await page.waitForTimeout(1800);
-
-      const currentCards = await scanCardsOnPage(page);
-      let sawTop10OnThisScreen = false;
-
-      for (const card of currentCards) {
-        if (existingCardIds.has(card.id)) continue;
-        existingCardIds.add(card.id);
-
-        const isFirstTimeSeen = card.hasNewBadge || !knownRanks.has(card.rankNum);
-        card.isNew = isFirstTimeSeen;
-        if (isFirstTimeSeen) {
-          newCardsThisRun++;
-          knownRanks.add(card.rankNum);
-        }
-
-        if (card.isTop100 && card.rankNum >= 1 && card.rankNum <= 100) {
-          rarePulls.set(`${card.rankNum}-${card.isHolo}`, card);
-          if (card.rankNum >= 1 && card.rankNum <= 10) {
-            sawTop10OnThisScreen = true;
-          }
-        }
-      }
-
-      if (sawTop10OnThisScreen && !top10ScreenshotPath) {
-        top10ScreenshotPath = 'top10_pull.png';
-        await page.screenshot({ path: top10ScreenshotPath, fullPage: true }).catch(() => {
-          top10ScreenshotPath = null;
-        });
-      }
-
-      if (!(await continueButton.isVisible().catch(() => false))) break;
-      await continueButton.click();
-      await page.waitForTimeout(1500);
-
-      const nextAppeared = await continueButton
-        .waitFor({ state: 'visible', timeout: 5000 })
-        .then(() => true)
-        .catch(() => false);
-      if (!nextAppeared) break;
+    if (rareList.length > 0) {
+      const rareAlert = `🔥 **TOP 100 / EPIC+ PULL ALERT!** 🔥\n${rareList.join('\n')}`;
+      await sendDiscordAlert(rareAlert, top10ScreenshotPath);
     }
-  } catch (err) {}
-
-  await updateCollectionProgress(page, state);
-
-  state.totalPacksOpened = (state.totalPacksOpened || 0) + packsOpenedNow;
-  state.lastOpenedAt = new Date().toISOString();
-  state.nextOpenTimestamp = computeNextSchedule();
-  state.discoveredRanks = Array.from(knownRanks);
-  saveState(state, true);
-
-  const sortedPulls = Array.from(rarePulls.values()).sort((a, b) => a.rankNum - b.rankNum);
-  const rareList = sortedPulls.map(
-    c => `• ${c.isNew ? '🆕 **[NEW!]** ' : ''}**${c.levelName}** (${c.rank}) — **${c.rarity}**${c.isHolo ? ' ✨ **[HOLO]**' : ''}`
-  );
-
-  const collectionStatus = state.collectionTotal
-    ? `\n• **Collection Progress:** \`${state.collectionTotal}\` (\`+${newCardsThisRun}\` new this run)`
-    : `\n• **New Cards This Run:** \`${newCardsThisRun}\``;
-
-  const cookieStatus = auth.cookieWasRefreshed ? `\n• 🔄 *Session cookie refreshed in memory!*` : '';
-
-  const report =
-    `🎉 **Opened ${packsOpenedNow} Pack(s)!** (\`${buttonText}\`)\n` +
-    `• **Total Packs Opened by Bot:** \`${state.totalPacksOpened}\`${collectionStatus}\n` +
-    `• **Next Opening In:** ${formatRemaining(state.nextOpenTimestamp)}${cookieStatus}`;
-
-  await sendDiscordAlert(report);
-
-  if (rareList.length > 0) {
-    const rareAlert = `🔥 **TOP 100 / EPIC+ PULL ALERT!** 🔥\n${rareList.join('\n')}`;
-    await sendDiscordAlert(rareAlert, top10ScreenshotPath);
+  } finally {
+    await context.close().catch(() => {});
   }
-
-  await browser.close();
 }
 
 (async () => {
@@ -204,30 +201,26 @@ async function openPacksCycle(state) {
   }
 
   if (action === 'check_packs') {
-    const browser = await chromium.launch({ headless: true, channel: 'chrome' });
-    const context = await browser.newContext({
-      viewport: { width: 1280, height: 800 },
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36'
-    });
-    if (activeCookie) {
-      const cookies = parseCookieList(activeCookie);
-      if (cookies.length) await context.addCookies(cookies);
-    }
-    const page = await context.newPage();
-    await page.goto(config.TARGET_URL, { waitUntil: 'networkidle', timeout: 45000 }).catch(() => {});
-    await page.waitForTimeout(5000);
-    const pageText = await page.locator('body').innerText().catch(() => '');
-    const packCounterMatch = pageText.match(/\b(\d+)\s*\/\s*10\b/);
-    const currentPacks = packCounterMatch ? `${packCounterMatch[1]} / 10` : 'Unknown';
-    const target = state.nextOpenTimestamp || computeNextSchedule();
+    const { context, page } = await launchStealthContext(activeCookie);
+    try {
+      await page.goto(config.TARGET_URL, { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+      await waitForCloudflare(page);
+      await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
+      await page.waitForTimeout(4000);
+      const pageText = await page.locator('body').innerText().catch(() => '');
+      const packCounterMatch = pageText.match(/\b(\d+)\s*\/\s*10\b/);
+      const currentPacks = packCounterMatch ? `${packCounterMatch[1]} / 10` : 'Unknown';
+      const target = state.nextOpenTimestamp || computeNextSchedule();
 
-    await sendDiscordAlert(
-      `📊 **Demon Gacha Status Check**\n` +
-      `• **Packs Currently Ready:** \`${currentPacks}\`\n` +
-      `• **Total Packs Opened by Bot:** \`${state.totalPacksOpened}\`\n` +
-      `• **Next Opening In:** ${formatRemaining(target)}`
-    );
-    await browser.close();
+      await sendDiscordAlert(
+        `📊 **Demon Gacha Status Check**\n` +
+        `• **Packs Currently Ready:** \`${currentPacks}\`\n` +
+        `• **Total Packs Opened by Bot:** \`${state.totalPacksOpened}\`\n` +
+        `• **Next Opening In:** ${formatRemaining(target)}`
+      );
+    } finally {
+      await context.close().catch(() => {});
+    }
     process.exit(0);
   }
 
